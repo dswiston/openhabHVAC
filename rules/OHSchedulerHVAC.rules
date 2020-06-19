@@ -1,0 +1,496 @@
+// If receive update to mode item
+//   If going from schedule to manual
+//     delete timers
+//     Set heat or cool
+//     Set target_temp
+//   else (going from manual to schedule
+//     inspect schedule and set timers
+// If received update to target temp
+//   if not in manual mode
+//     declare error, end
+//   Change target temp
+// If received update to schedule
+//   If in manual mode
+//     do nothing
+//   else
+//     inspect schedule and set timers
+// If due to cron job
+// 
+
+// failsafe: targetItem.state == NULL || targetItem.state == ''
+
+
+// --- By Geo Magadan | nepotu.ro --- //
+// ---        version 1.2        --- //
+//HVAC Scheduler - Target Temperature Management Rules
+import java.util.concurrent.locks.ReentrantLock
+
+//Global variables
+var ReentrantLock tempCtlLock = new ReentrantLock()
+var ReentrantLock tempQueueLock = new ReentrantLock()
+var Timer tempCtlTimer = null
+var String ruleName = 'temperature-control.rules'
+
+
+
+
+// HVAC Scheduler - Target Temperature Management
+rule "HVAC Scheduler - Mode Update"
+when
+    Item   HVAC_Mode received command
+then
+
+if (tempCtlLock.tryLock()) {
+    try {
+
+        // Initial variable setup
+        var String mode = HVAC_Mode.state.toString
+        var Number HEAT = 1
+        var Number COOL = 2
+        var Number OFF = 0
+
+        logInfo(ruleName, 'mode update: Triggered by update sent to mode item <---------------------')
+            // if going to OFF mode (ok if already in too, resending won't hurt anything)
+        if (mode.contains('Off')) {
+            logInfo(ruleName, 'mode update: Off detected <---------------------')
+            // first, delete timers, no need for them in manual mode
+            if (tempCtlTimer !== null) {
+                logInfo(ruleName, 'mode update: Timers existed from schedule mode, deleting them <---------------------')
+                tempCtlTimer.cancel()
+                tempCtlTimer = null
+            }
+            // send update to mode
+            //tstat_mode.postUpdate(OFF)
+        } else if (mode.contains('Manual')) {
+            // if going to a manual mode (ok if already in one too, resending won't hurt anything)
+            logInfo(ruleName, 'mode update: Manual mode detected <---------------------')
+            // first, delete timers, no need for them in manual mode
+            if (tempCtlTimer !== null) {
+                logInfo(ruleName, 'mode update: Timers existed from schedule mode, deleting them <---------------------')
+                tempCtlTimer.cancel()
+                tempCtlTimer = null
+            }
+            // next determine if in heating or cooling mode and send
+            if (mode.contains("HEAT")) {
+                logInfo(ruleName, 'mode update: Setting mode to HEAT <---------------------')
+                // send update to mode
+                //tstat_mode.postUpdate(HEAT)
+            } else if (mode.contains('COOL')) {
+                logInfo(ruleName, 'mode update: Setting mode to COOL <---------------------')
+                // send update to mode
+                //tstat_mode.postUpdate(COOL)
+            } else {
+                logInfo(ruleName, '-----> ERROR, unknown mode, should never be here! <---------------')
+            }
+            // finally, set target temp
+            logInfo(ruleName, 'mode update: Setting target temp <---------------------')
+            //tstat_setpoint.postUpdate(HVAC_LR_Target_Temp.state)
+        } else if (mode.contains('Schedule')) {
+            logInfo(ruleName, '-----> Schedule mode detected <---------------------')
+            // inspect schedule and set timers
+            logInfo(ruleName, HVAC_Schedule.state.toString)
+            if (HVAC_Schedule.state == NULL || HVAC_Schedule.state.toString == '') {
+                // No schedule defined, set manual version of heating or cooling
+                logInfo(ruleName, '-----> No schedule defined, reverting to maual <---------------------')
+                if (mode.contains('COOL')) {
+                    HVAC_Mode.postUpdate('COOL - Manual')
+                } else {
+                    HVAC_Mode.postUpdate('HEAT - Manual')
+                }
+            } else {
+                logInfo(ruleName, '-----> Posting update to schedule <---------------------')
+                HVAC_Schedule.sendCommand(HVAC_Schedule.state.toString)
+            }
+        } else {
+            logInfo(ruleName, '-----> ERROR, unknown mode, should never be here! <---------------')
+        }
+
+    } catch(Exception e) {
+        logInfo(ruleName, 'Temperature control error: ' + e.toString)
+        tempCtlLock.unlock()
+        logInfo(ruleName, '-----> unlocked during mode update <---------------------')
+    } finally {
+        tempCtlLock.unlock()
+        logInfo(ruleName, '-----> unlocked during mode update <---------------------')
+    }
+} else {
+    logInfo(ruleName, '-----> Failed to obtain lock during mode update <---------------------')
+}
+end
+
+
+
+rule "HVAC Scheduler - Schedule Update"
+when
+    Item   HVAC_Schedule received command
+then
+
+if (tempCtlLock.tryLock()) {
+    try {
+
+        // Initial variable setup
+        var String mode = HVAC_Mode.state.toString
+        var DateTime timeNow = now()
+        var String temperatureQueue = null
+        var String jsonHVACSchedule = HVAC_Schedule.state.toString
+        var String jsonItemSchedule = null
+        var String jsonItemDaySchedule = null
+        logInfo(ruleName, '-----> Triggered by update to schedule <---------------------')
+
+        // Cancel any existing timer
+        if (tempCtlTimer !== null) {
+            logInfo(ruleName,'-----> deleting existing timer <-----------------------------')
+            tempCtlTimer.cancel()
+            tempCtlTimer = null
+        }
+
+        // Parse the item schedule if the name matches AND HVAC is in a schedule mode
+        if (jsonHVACSchedule.contains('"' + HVAC_LR_Target_Temp.name.toString + '"') && mode.contains('Schedule')) {
+            // Extract only the JSON that contains the target name
+            jsonItemSchedule = transform('JSONPATH', '$.' + HVAC_LR_Target_Temp.name, jsonHVACSchedule)
+            // Replace the equal with colon
+            jsonItemSchedule = jsonItemSchedule.replaceAll('=', ':')
+            logInfo(ruleName, '-----> Current schedule: ' + jsonItemSchedule + '<---------------------')
+
+            if (jsonItemSchedule !== null && jsonItemSchedule != '') {
+                logInfo(ruleName, '-----> non-empty schedule found <---------------------')
+                var Number i = 0
+                var String[] jsonItemDayScheduleArray = null
+                var int currD = timeNow.getDayOfWeek()
+                var int currH = timeNow.getHourOfDay()
+                var int currM = timeNow.getMinuteOfHour()
+                var String currDStr = currD.toString()
+                var String currHStr = null
+                if (currH < 10) {currHStr = '0' + currH.toString} else {currHStr = currH.toString}
+                var String currMStr = null
+                if (currM < 10) {currMStr = '0' + currM.toString} else {currMStr = currM.toString}
+                var String tmpTimeVal = null
+                var String[] tmpTimeValArray = null
+                var String tmpTime = null
+                var Number tmpVal = null
+                var String nextActivityTime = null
+                var String nextActivityDay = null
+                var Number nextActivityVal = null
+                var String prevActivityDay = null
+                var String prevActivityTime = null
+                var Number prevActivityVal = null
+                logInfo(ruleName, '-----> current time: (day) ' + currD.toString + ' (hours) ' + currHStr + ' (minute) ' + currMStr + '<----------------------------')
+
+                // Loop over each days schedule activities 
+                while ((i=i+1) <= 7) {
+                    logInfo(ruleName, '-----> day loop, day: ' + i.toString + '<----------------------------')
+                    // Parse the (item) daily schedule, j represents the index activities for that day
+                    var Number j = -1
+                    // Grab just this days JSON string
+                    jsonItemDaySchedule = transform('JSONPATH', '$.D'+i, jsonItemSchedule)
+                    // Remove empty objects
+                    jsonItemDaySchedule = jsonItemDaySchedule.replaceAll('[{}]', '')
+                    // If there is actually something scheduled on this day
+                    if (jsonItemDaySchedule !== null && jsonItemDaySchedule != '') {
+                        logInfo(ruleName, '-----> daily schedule: ' + jsonItemDaySchedule + ' <----------------------------')
+                        // Split the JSON string in to individually scheduled items
+                        jsonItemDayScheduleArray = jsonItemDaySchedule.split(',')
+                        // for each activity ----------------------------------------------------------
+                        while ((j=j+1) < jsonItemDayScheduleArray.length) {
+                            tmpTimeVal = jsonItemDayScheduleArray.get(j.intValue()).replaceAll(' ', '')
+                            logInfo(ruleName, '-----> activity loop, activity: ' + tmpTimeVal + ' <----------------------------')
+                            tmpTimeValArray = tmpTimeVal.split('=')                                       // split JSON into times and temps
+                            tmpTime = tmpTimeValArray.get(0)                                              // time associated with scheduled item
+                            tmpVal = DecimalType.valueOf(tmpTimeValArray.get(1))                          // temperature associated with scheduled item
+                            if (nextActivityTime === null) {
+                                logInfo(ruleName, '-----> first activity identified, assigning to next activity <----------------------')
+                                nextActivityDay = i.toString()
+                                nextActivityTime = tmpTime
+                                nextActivityVal = tmpVal
+                                prevActivityDay = i.toString()
+                                prevActivityTime = tmpTime
+                                prevActivityVal = tmpVal
+                            }
+                            // if the day and time of the activity is less than or equal to that of the current day/time ----------------------------
+                            if (i < currD || (i == currD && tmpTime <= 'T' + currHStr + currMStr)) {
+                                logInfo(ruleName, '-----> day and time of activity is less than current day/time <----------------------')
+                                // Update last previous activity to this activity
+                                prevActivityDay = i.toString()
+                                prevActivityTime = tmpTime
+                                prevActivityVal = tmpVal        
+                            // the activity is greater than that of the current day/time -------------------------------------------------
+                            } else if (i > currD || (i == currD && tmpTime > 'T' + currHStr + currMStr)) {
+                                logInfo(ruleName, '-----> day and time of activity is greater than current day/time')
+                                // Update the next activity to this activity
+                                nextActivityTime = tmpTime
+                                nextActivityDay = i.toString()
+                                nextActivityVal = tmpVal
+                                // break out of loop
+                                i = 8
+                                j = jsonItemDayScheduleArray.length
+                            } else {
+                                // unexpected location
+                                logInfo(ruleName, '-----> unexpected location in activity determination <---------------------')
+                            }
+                        }
+                    }
+                }
+                // if next activity is null  ---------------------------------------------------------------------------------------------
+                if (nextActivityTime === null) {
+                    // there were no activities specified in the schedule, error condition
+                    logInfo(ruleName, '-----> unexpected no activity in loop <---------------------')
+                } else {
+                    // set current temp to the previous activity
+                    HVAC_LR_Target_Temp.postUpdate(prevActivityVal)
+                    // next activity = previous activity --- there is only one scheduled activity
+                    if (nextActivityTime == prevActivityTime && nextActivityDay == prevActivityDay) {
+                        logInfo(ruleName, '-----> there is only one scheduled activity <---------------------')
+                        logInfo(ruleName, '-----> Next activity: (day) ' + nextActivityDay + ' (time) ' + nextActivityTime + ' (value) ' + nextActivityVal.toString() + ' <---------------------')
+                        // no need to schedule a timer since this value will never change
+                    // there is more than one activity in the schedule
+                    } else {
+                        var int nextActivityDayInt = Integer::parseInt(nextActivityDay)
+                        var int nextActivityHrsInt = Integer::parseInt(nextActivityTime.substring(1,3))
+                        var int nextActivityMinInt = Integer::parseInt(nextActivityTime.substring(3,5))
+                        var int dayOffset = null
+                        var int hrsOffset = nextActivityHrsInt - currH
+                        var int minOffset = nextActivityMinInt - currM
+                        // if next activity < current day/time --- we wrapped in the week
+                        if (nextActivityDay < currDStr || (nextActivityDay == currDStr && nextActivityTime < currHStr+currMStr)) {
+                            logInfo(ruleName, '-----> the next event wrapped in the week <---------------------')
+                            logInfo(ruleName, '-----> Next activity: (day) ' + nextActivityDay + ' (time) ' + nextActivityTime + ' (value) ' + nextActivityVal.toString() + ' <---------------------')    
+                            // schedule timer for wrapped time
+                            dayOffset = nextActivityDayInt + (7-currD)
+                        // else nominal case
+                        } else {
+                            dayOffset = nextActivityDayInt - currD
+                            logInfo(ruleName, '-----> reached nominal case <---------------------')
+                            logInfo(ruleName, '-----> Next activity: (day) ' + nextActivityDay + ' (time) ' + nextActivityTime + ' (value) ' + nextActivityVal.toString() + ' <---------------------')
+                        }
+                        // schedule timer
+                        temperatureQueue = HVAC_LR_Target_Temp.name + '=' + nextActivityVal.toString()
+                        var nextScheduleTime = timeNow.plusDays(dayOffset).plusHours(hrsOffset).plusMinutes(minOffset)
+                        var String dateTimeFormat 'MM/dd/yyyy HH:mm'
+                        logInfo(ruleName, '-----> Now: ' + timeNow.toString(dateTimeFormat) + ' Timer: ' + nextScheduleTime.toString(dateTimeFormat) + '<---------------------')
+                        // Activate the timer
+                        //HVAC_Next_Change_Time.postUpdate( nextScheduleTime )
+                        tempCtlTimer = createTimer(nextScheduleTime, [|
+                                HVAC_Queue.postUpdate(temperatureQueue)
+                            ])
+                    }
+
+                }
+            }
+        }
+
+        /* val dtAsString = Day.state.toString + "T" + Hour.state.toString + ":" + Min.state.toString
+        Next change @2020-06-13T23:00:00.000-05:00 | Changes : HVAC_LR_Target_Temp=76.0
+        {D1:{T2300:76.0}, D2:{T1000:70.0, T1100:77.0, T2300:76.0}, D3:{T2300:76.0}, D4:{T2300:76.0}, D5:{T2300:76.0}, D6:{T2300:76.0}, D7:{T2300:76.0}} */
+
+    } catch(Exception e) {
+        logInfo(ruleName, 'Temperature control error: ' + e.toString)
+        tempCtlLock.unlock()
+        logInfo(ruleName, '-----> unlocked during schedule update <---------------------')
+    } finally {
+        tempCtlLock.unlock()
+        logInfo(ruleName, '-----> unlocked during schedule update <---------------------')
+    }
+} else {
+    logInfo(ruleName, '-----> Failed to obtain lock during schedule update <---------------------')
+}
+end
+
+
+
+
+
+
+rule "HVAC Scheduler - Target Temp Update"
+when
+    Item   HVAC_LR_Target_Temp received command
+then
+
+if (tempCtlLock.tryLock()) {
+    try {
+        // Initial variable setup
+        var String mode = HVAC_Mode.state.toString
+        logInfo(ruleName, '-----> Triggered by update to target temp <---------------------')
+        if (mode.contains('Manual')) {
+            // Received a set temperature update, post to the item
+            logInfo(ruleName, 'mode update: Setting target temp <---------------------')
+            //tstat_setpoint.postUpdate(HVAC_LR_Target_Temp.state)
+        } else {
+            logInfo(ruleName, '-----> ERROR, set temp update but not in manual mode, should not be here! <---------------')
+        }
+    } catch(Exception e) {
+        logInfo(ruleName, 'Temperature control error: ' + e.toString)
+        tempCtlLock.unlock()
+        logInfo(ruleName, '-----> unlocked during temp update <---------------------')
+    } finally {
+        tempCtlLock.unlock()
+        logInfo(ruleName, '-----> unlocked during temp update <---------------------')
+    }
+} else {
+    logInfo(ruleName, '-----> Failed to obtain lock during temp target update <---------------------')
+}
+end
+
+
+
+
+// HVAC Scheduler - A queue item, used to set the target temperature for multiple items at the same time
+rule "HVAC Scheduler - Target Temperature Queue"
+when
+    Item HVAC_Queue received update 
+then
+
+    // This rule is only executed by a timer, cancel existing timer
+    if (tempCtlTimer !== null) {
+        logInfo(ruleName,'-----> deleting existing timer <-----------------------------')
+        tempCtlTimer.cancel()
+        tempCtlTimer = null
+    }
+
+    logInfo(ruleName, '-----> Timer triggered queue update <---------------------')
+    if (tempQueueLock.tryLock()) {
+        logInfo(ruleName, '-----> Queue: not locked <---------------------')
+        try {
+            if (HVAC_Queue.state != NULL && HVAC_Queue.state != '') {
+                logInfo(ruleName, '-----> Queue: queue not null/empty <---------------------')
+                grpTargetTemp.members.forEach [ targetItem | {
+                        var Number j = -1
+                        var String[] itemsTempArray = null
+                        itemsTempArray = (HVAC_Queue.state as StringType).toString.split(';')
+                        while ((j=j+1) < itemsTempArray.length) {
+                            if (itemsTempArray.get(j.intValue()).split('=').get(0) == targetItem.name) {
+                                logInfo(ruleName, 'Target temperature for item ' + targetItem.name
+                                    + ' changed from ' + targetItem.state
+                                    + ' to ' + DecimalType.valueOf(itemsTempArray.get(j.intValue()).split('=').get(1)))
+                                targetItem.postUpdate(DecimalType.valueOf(itemsTempArray.get(j.intValue()).split('=').get(1)))
+                            }
+                        }
+                    }
+                ]
+                // Cleanup the queue
+                HVAC_Queue.postUpdate(NULL)
+                logInfo(ruleName, 'Target Temperature Queue cleaned up')
+            } else {
+                logInfo(ruleName, 'Queue: queue null, posting update to schedule item <-------------------------------')
+                HVAC_Schedule.sendCommand(HVAC_Schedule.state.toString)
+            }
+        } catch(Exception e) {
+                logInfo(ruleName, 'Target Temperature Queue control error: ' + e.toString)
+        } finally {
+                tempQueueLock.unlock()
+        }
+    }
+end
+
+
+
+
+
+
+                /*
+                // Loop: week days
+                while ((i=i+1) <= 7) {
+                    // Parse the (item) daily schedule
+                    var Number j = -1
+                    // Look for current day (i) in schedule
+                    if (jsonItemSchedule.contains('D' + i)) {
+                        // Grab just this days JSON string
+                        jsonItemDaySchedule = transform('JSONPATH', '$.D'+i, jsonItemSchedule)
+                        // Remove empty objects
+                        jsonItemDaySchedule = jsonItemDaySchedule.replaceAll('[{}]', '')
+                        // If there is actually something scheduled on this day
+                        if (jsonItemDaySchedule !== null && jsonItemDaySchedule != '') {
+                            // Split the JSON string in to individually scheduled items
+                            jsonItemDayScheduleArray = jsonItemDaySchedule.split(',')
+                            // Loop: each day schedule
+                            while ((j=j+1) < jsonItemDayScheduleArray.length) {
+                                nextDay = 'D' + i
+                                nextTimeVal = jsonItemDayScheduleArray.get(j.intValue()).replaceAll(' ', '')
+                                nextTimeValArray = nextTimeVal.split('=')
+                                nextTime = nextTimeValArray.get(0)                                              // time associated with scheduled item
+                                nextVal = DecimalType.valueOf(nextTimeValArray.get(1))                          // temperature associated with scheduled item
+                                if (prevDay !== null && ('D' + i + nextTime) > ('D' + timeNow.getDayOfWeek + currentTime)) {
+                                    // Force exit from both i and j while loops
+                                    j = jsonItemDayScheduleArray.length
+                                    i = 8
+                                } else if (('D' + i + nextTime) <= ('D' + timeNow.getDayOfWeek + currentTime)) {
+                                    prevDay = 'D' + i
+                                    prevTime = nextTime
+                                    prevVal = nextVal
+                                }
+                            }
+                        }
+                    }
+                }
+                // If no previous value found so far, then use the last available
+                if (prevDay === null && nextTime !== null && nextVal !== null) {
+                    prevDay = nextDay
+                    prevTime = nextTime
+                    prevVal = nextVal
+                }
+                // Validate next. If no other future values, then use the first one available as next
+                if (prevDay == nextDay && prevTime == nextTime && prevVal == nextVal) {
+                    i = 0
+                    while ((i=i+1) <= 7) {
+                        if (jsonItemSchedule.contains('D' + i)) {
+                            jsonItemDaySchedule = transform('JSONPATH', '$.D'+i, jsonItemSchedule)
+                            // Remove empty objects
+                            jsonItemDaySchedule = jsonItemDaySchedule.replaceAll('[{}]', '')
+                            if (jsonItemDaySchedule !== null && jsonItemDaySchedule != '') {
+                                nextDay = 'D' + i
+                                jsonItemDayScheduleArray = jsonItemDaySchedule.split(',')
+                                nextTimeVal = jsonItemDayScheduleArray.get(0)
+                                nextTimeValArray = nextTimeVal.split('=')
+                                nextTime = nextTimeValArray.get(0).replaceAll(' ', '')
+                                nextVal = DecimalType.valueOf(nextTimeValArray.get(1))
+                                i = 8
+                            }
+                        }
+                    }
+                }
+                // Process the schedule values
+                if (nextDay !== null && nextTime !== null && nextVal !== null) {
+                    // The changeTime is computed from the Dx-Txxxx pair and marks the next schedule change
+                    var Number upToNext = null
+                    var DateTime changeTime = null
+                    if (timeNow.getDayOfWeek <= Integer.valueOf(nextDay.substring(1,2))) {
+                        upToNext = Integer.valueOf(nextDay.substring(1,2)) - timeNow.getDayOfWeek
+                    } else {
+                        upToNext = 7 - timeNow.getDayOfWeek + Integer.valueOf(nextDay.substring(1,2))
+                    }
+                    // upToNext = minutes since midnight until the next schedule change
+                    upToNext = upToNext*24*60 + Integer.valueOf(nextTime.substring(1,3))*60 + Integer.valueOf(nextTime.substring(3,5))
+                    changeTime = timeNow.withTimeAtStartOfDay().plusMinutes(upToNext.intValue())
+                    if (upToTime === null) {
+                        // Init the queue
+                        upToTime = changeTime
+                        temperatureQueue = HVAC_LR_Target_Temp.name + '=' + nextVal
+                    } else {
+                        if ((upToTime.millis/trimToMin).intValue() > (changeTime.millis/trimToMin).intValue()) {
+                            // Reset the queue
+                            upToTime = changeTime
+                            temperatureQueue = HVAC_LR_Target_Temp.name + '=' + nextVal
+                        } else if ((upToTime.millis/trimToMin).intValue() == (changeTime.millis/trimToMin).intValue()) {
+                            // Add item to queue
+                            temperatureQueue = temperatureQueue + ';' + HVAC_LR_Target_Temp.name + '=' + nextVal
+                        }
+                    }
+                    // [fail-safe] Init target temperature if not set
+                    if (prevVal !== null && (HVAC_LR_Target_Temp.state == NULL || HVAC_LR_Target_Temp.state == '')) {
+                        logInfo(ruleName, 'Target temperature for item ' + HVAC_LR_Target_Temp.name + ' initiated to : ' + prevVal)
+                        HVAC_LR_Target_Temp.postUpdate(prevVal)
+                    }
+                }
+            }
+        }
+
+        // Activate the timer
+        if (upToTime !== null) {
+            logInfo(ruleName, '[' + mode + '] Next change @ ' + upToTime + ' | Changes : ' + temperatureQueue)
+            HVAC_Next_Change_Time.postUpdate(upToTime.toString)
+            tempCtlTimer = createTimer(upToTime, [|
+                    HVAC_Queue.postUpdate(temperatureQueue)
+                    tempCtlTimer.cancel()
+                    tempCtlTimer = null
+                ])
+        }
+        */
